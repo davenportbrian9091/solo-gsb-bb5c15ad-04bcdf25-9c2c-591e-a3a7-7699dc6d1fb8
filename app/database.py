@@ -94,6 +94,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_claim
     ON rescan_receipts (claim_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_batch
     ON rescan_receipts (batch_id);
+
+-- 交付快照：创建时固化该胶卷的预期闭区间、实扫帧（保序去重集合）与缺帧闭区间。
+-- 此后批次导入、撤销或补扫均不修改快照内容；最后一批被撤销后快照仍可查询，
+-- 此时以空状态与快照做差异对比。
+CREATE TABLE IF NOT EXISTS roll_snapshots (
+    id              TEXT PRIMARY KEY,
+    roll_no         TEXT NOT NULL,
+    expected_json   TEXT NOT NULL,
+    frames_json     TEXT NOT NULL,
+    missing_json    TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_roll ON roll_snapshots (roll_no);
 """
 
 

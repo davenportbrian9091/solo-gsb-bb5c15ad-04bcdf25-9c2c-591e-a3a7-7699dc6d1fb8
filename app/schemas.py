@@ -150,4 +150,40 @@ class RescanReceiptOut(BaseModel):
     created_at: str
 
 
+class RollSnapshotOut(BaseModel):
+    snapshot_id: str = Field(..., description="快照 ID，可长期用于差异查询")
+    roll_no: str
+    expected_ranges: list[list[int]] = Field(
+        ..., description="固化时的预期覆盖闭区间（合并后）"
+    )
+    frames: list[int] = Field(..., description="固化时的实扫帧（去重排序）")
+    missing_ranges: list[list[int]] = Field(
+        ..., description="固化时的缺帧闭区间（预期范围内未扫到的连续段）"
+    )
+    created_at: str = Field(..., description="快照创建时间（UTC ISO-8601）")
+
+
+class RangeDiff(BaseModel):
+    added: list[list[int]] = Field(
+        ..., description="当前相对快照**新增**的闭区间（当前有、快照无）"
+    )
+    removed: list[list[int]] = Field(
+        ..., description="当前相对快照**消失**的闭区间（快照有、当前无）"
+    )
+
+
+class SnapshotDiffOut(BaseModel):
+    snapshot_id: str
+    roll_no: str
+    roll_exists: bool = Field(
+        ...,
+        description="查询时胶卷是否存在（最后一批被撤销后为 false，此时当前状态按空处理）",
+    )
+    snapshot_created_at: str
+    compared_at: str = Field(..., description="差异计算时间（UTC ISO-8601）")
+    expected: RangeDiff = Field(..., description="预期覆盖的差异（区间集合运算）")
+    frames: RangeDiff = Field(..., description="实扫帧的差异（帧集合先压成闭区间再比较）")
+    missing: RangeDiff = Field(..., description="缺帧区间的差异（区间集合运算）")
+
+
 RollState.model_rebuild()

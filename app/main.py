@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="胶片档案扫描整理 API",
-    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执。",
-    version="1.3.0",
+    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比。",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -103,6 +103,47 @@ def get_roll(roll_no: str, conn: Connection = Depends(database.get_db)):
     if result is None:
         raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
     return result
+
+
+@app.post(
+    "/rolls/{roll_no}/snapshots",
+    response_model=schemas.RollSnapshotOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["交付快照"],
+)
+def create_roll_snapshot(
+    roll_no: str, conn: Connection = Depends(database.get_db)
+):
+    """为胶卷创建交付快照：在一致性读中固化当时的预期闭区间、实扫帧与缺帧闭区间。
+
+    返回可长期查询的快照 ID；快照不随批次导入、撤销或补扫改变。
+    胶卷不存在（尚未导入任何批次）返回 404。
+    """
+    try:
+        return services.create_snapshot(conn, roll_no.strip())
+    except services.RollNotFoundError:
+        raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
+
+
+@app.get(
+    "/rolls/{roll_no}/snapshots/{snapshot_id}/diff",
+    response_model=schemas.SnapshotDiffOut,
+    tags=["交付快照"],
+)
+def get_roll_snapshot_diff(
+    roll_no: str, snapshot_id: str, conn: Connection = Depends(database.get_db)
+):
+    """返回胶卷当前状态相对快照的差异。
+
+    预期覆盖、实扫帧、缺帧三个维度独立比较，分别给出相对快照新增与消失的
+    闭区间（按区间做集合运算）。即使胶卷最后一批已被撤销，只要快照属于该
+    胶卷编号，仍返回差异（当前按空状态处理，roll_exists=false）。未知快照
+    ID 或快照与胶卷编号不匹配返回 404。
+    """
+    try:
+        return services.get_snapshot_diff(conn, roll_no.strip(), snapshot_id.strip())
+    except services.SnapshotNotFoundError:
+        raise HTTPException(status_code=404, detail="快照不存在或不属于该胶卷")
 
 
 @app.post(

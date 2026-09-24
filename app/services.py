@@ -39,20 +39,14 @@ def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
 def missing_intervals(
     expected: list[tuple[int, int]], frames: set[int]
 ) -> list[tuple[int, int]]:
-    """返回合并后的预期范围内、未被扫描帧覆盖的连续缺帧区间。"""
-    result: list[tuple[int, int]] = []
-    for s, e in merge_intervals(expected):
-        gap_start: int | None = None
-        for n in range(s, e + 1):
-            if n in frames:
-                if gap_start is not None:
-                    result.append((gap_start, n - 1))
-                    gap_start = None
-            elif gap_start is None:
-                gap_start = n
-        if gap_start is not None:
-            result.append((gap_start, e))
-    return result
+    """返回合并后的预期范围内、未被扫描帧覆盖的连续缺帧区间。
+
+    直接做区间集合差（预期区间 − 帧点区间），不在帧号轴上逐帧展开，
+    因此预期范围跨度巨大（如 [1, 20亿]）时成本也只与区间/帧数相关。
+    """
+    return _subtract_merged(
+        merge_intervals(expected), frames_to_ranges(frames)
+    )
 
 
 def out_of_range_frames(
@@ -67,23 +61,71 @@ def out_of_range_frames(
 def subtract_intervals(
     base: list[tuple[int, int]], cuts: list[tuple[int, int]]
 ) -> list[tuple[int, int]]:
-    """从一组已合并闭区间 base 中扣除 cuts 覆盖的部分，返回合并后的剩余闭区间。"""
+    """从一组闭区间 base 中扣除 cuts 覆盖的部分，返回合并后的剩余闭区间。
+
+    基于有序区间的单趟扫描，总时间 O(n+m)；base/cuts 无需预先合并
+    （重叠/相邻会被规范化），输出恒为互不相交、不相邻的闭区间。
+    """
+    return difference_intervals(base, cuts)
+
+
+def frames_to_ranges(frames) -> list[tuple[int, int]]:
+    """把排序后的帧号集合压成连续闭区间，例如 [1,2,3,5,8,9] -> [(1,3),(5,5),(8,9)]。
+
+    实扫帧以帧集合持久化，差异比较时先经此函数转成区间，避免逐帧参与集合运算。
+    """
     result: list[tuple[int, int]] = []
-    for s, e in merge_intervals(base):
-        segments = [(s, e)]
-        for cs, ce in merge_intervals(cuts):
-            next_segments: list[tuple[int, int]] = []
-            for seg_s, seg_e in segments:
-                if ce < seg_s or cs > seg_e:
-                    next_segments.append((seg_s, seg_e))
-                else:
-                    if cs > seg_s:
-                        next_segments.append((seg_s, min(seg_e, cs - 1)))
-                    if ce < seg_e:
-                        next_segments.append((max(seg_s, ce + 1), seg_e))
-            segments = next_segments
-        result.extend(segments)
-    return merge_intervals(result)
+    start: int | None = None
+    prev: int | None = None
+    for f in sorted(frames):
+        if start is None:
+            start = prev = f
+        elif f == prev + 1:
+            prev = f
+        else:
+            result.append((start, prev))
+            start = prev = f
+    if start is not None:
+        result.append((start, prev))
+    return result
+
+
+def _subtract_merged(
+    a: list[tuple[int, int]], b: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """A − B，要求 a、b 均为已合并（互不重叠/相邻）、按起点升序的闭区间。
+
+    双指针单趟扫描，总时间 O(n+m)，不展开任何区间。
+    """
+    result: list[tuple[int, int]] = []
+    j = 0
+    nb = len(b)
+    for s, e in a:
+        # 完全落在当前段左侧的切割区间对本段及后续段都不再有用，指针单调前进
+        while j < nb and b[j][1] < s:
+            j += 1
+        pos = s
+        k = j
+        while k < nb and b[k][0] <= e:
+            cs, ce = b[k]
+            if ce >= pos:
+                if cs > pos:
+                    result.append((pos, min(e, cs - 1)))
+                if ce >= e:
+                    pos = e + 1
+                    break
+                pos = ce + 1
+            k += 1
+        if pos <= e:
+            result.append((pos, e))
+    return result
+
+
+def difference_intervals(
+    a: list[tuple[int, int]], b: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """闭区间集合差 A − B（输入允许重叠/相邻，会先合并规范化），线性扫描。"""
+    return _subtract_merged(merge_intervals(a), merge_intervals(b))
 
 
 def intersect_intervals(
@@ -97,6 +139,16 @@ def intersect_intervals(
             if s <= e:
                 result.append((s, e))
     return merge_intervals(result)
+
+
+def _range_diff(
+    current: list[tuple[int, int]], snapshotted: list[tuple[int, int]]
+) -> schemas.RangeDiff:
+    """两个已合并区间集合的双向差：新增 = 当前−快照，消失 = 快照−当前。"""
+    return schemas.RangeDiff(
+        added=[list(x) for x in _subtract_merged(current, snapshotted)],
+        removed=[list(x) for x in _subtract_merged(snapshotted, current)],
+    )
 
 
 # ---------- 数据访问 ----------
@@ -792,3 +844,114 @@ def submit_rescan_receipt(
     ).fetchone()
     assert claim is not None and receipt is not None
     return _receipt_out(conn, claim, receipt, repeated=False), 201
+
+
+# ---------- 交付快照 ----------
+
+class SnapshotNotFoundError(Exception):
+    """快照不存在，或快照不属于 URL 中的胶卷编号。"""
+
+    def __init__(self, snapshot_id: str):
+        self.snapshot_id = snapshot_id
+        super().__init__(f"快照不存在或不属于该胶卷: {snapshot_id}")
+
+
+def create_snapshot(
+    conn: sqlite3.Connection, roll_no: str
+) -> schemas.RollSnapshotOut:
+    """在一致性读中固化胶卷当前状态（预期闭区间、实扫帧、缺帧闭区间）。
+
+    BEGIN IMMEDIATE 取写锁使本次读取与并发导入/撤销串行化，快照内容即提交
+    瞬间的一致状态。快照只新增、从不修改：后续批次导入、撤销与补扫都不会
+    影响其内容。胶卷不存在（尚未导入任何批次）抛 RollNotFoundError（404）。
+    """
+    snapshot_id = uuid.uuid4().hex
+    now = _now_iso()
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not _roll_exists(conn, roll_no):
+            raise RollNotFoundError(roll_no)
+        st = _state_from_db(conn, roll_no)
+        conn.execute(
+            """INSERT INTO roll_snapshots
+                   (id, roll_no, expected_json, frames_json, missing_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                snapshot_id,
+                roll_no,
+                json.dumps([list(x) for x in st["expected"]]),
+                json.dumps(sorted(st["frames"])),
+                json.dumps([list(x) for x in st["missing"]]),
+                now,
+            ),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    return schemas.RollSnapshotOut(
+        snapshot_id=snapshot_id,
+        roll_no=roll_no,
+        expected_ranges=[list(x) for x in st["expected"]],
+        frames=sorted(st["frames"]),
+        missing_ranges=[list(x) for x in st["missing"]],
+        created_at=now,
+    )
+
+
+def get_snapshot_diff(
+    conn: sqlite3.Connection, roll_no: str, snapshot_id: str
+) -> schemas.SnapshotDiffOut:
+    """计算胶卷**当前**状态相对快照的差异。
+
+    三个维度（预期覆盖、实扫帧、缺帧）独立比较，各自给出相对快照新增
+    （当前有、快照无）与消失（快照有、当前无）的闭区间，全程按区间做集合
+    运算，不逐帧展开大范围。
+
+    - 快照不存在（未知 ID）或其胶卷编号与 URL 不一致 → SnapshotNotFoundError（404）；
+    - 即使该胶卷最后一批已被撤销（当前视为不存在），只要快照属于该编号，
+      仍返回 200：roll_exists=false，当前状态按空集合处理，差异即“快照内容
+      全部消失”。
+    """
+    snap = conn.execute(
+        "SELECT * FROM roll_snapshots WHERE id = ?", (snapshot_id,)
+    ).fetchone()
+    if snap is None or snap["roll_no"] != roll_no:
+        raise SnapshotNotFoundError(snapshot_id)
+
+    snap_expected = [tuple(x) for x in json.loads(snap["expected_json"])]
+    snap_frames = [tuple(x) for x in frames_to_ranges(json.loads(snap["frames_json"]))]
+    snap_missing = [tuple(x) for x in json.loads(snap["missing_json"])]
+
+    # 一致性读：差异计算期间不允许并发写入改变三个维度的相互对应关系
+    conn.execute("BEGIN")
+    try:
+        if _roll_exists(conn, roll_no):
+            roll_exists = True
+            st = _state_from_db(conn, roll_no)
+            cur_expected = st["expected"]
+            cur_frames = frames_to_ranges(st["frames"])
+            cur_missing = st["missing"]
+        else:
+            # 胶卷最后一批已被撤销：快照仍有效，当前按空状态比较
+            roll_exists = False
+            cur_expected = []
+            cur_frames = []
+            cur_missing = []
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    return schemas.SnapshotDiffOut(
+        snapshot_id=snapshot_id,
+        roll_no=roll_no,
+        roll_exists=roll_exists,
+        snapshot_created_at=snap["created_at"],
+        compared_at=_now_iso(),
+        expected=_range_diff(cur_expected, snap_expected),
+        frames=_range_diff(cur_frames, snap_frames),
+        missing=_range_diff(cur_missing, snap_missing),
+    )
