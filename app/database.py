@@ -94,6 +94,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_claim
     ON rescan_receipts (claim_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_batch
     ON rescan_receipts (batch_id);
+
+-- 交付快照：固化创建时刻的预期闭区间、实扫帧（压缩为连续闭区间）与缺帧闭区间。
+-- 只增不改：批次导入、撤销、补扫均不回写本表，快照可长期用于差异对比。
+CREATE TABLE IF NOT EXISTS roll_snapshots (
+    id                   TEXT PRIMARY KEY,
+    roll_no              TEXT NOT NULL,
+    expected_ranges_json TEXT NOT NULL,
+    frame_ranges_json    TEXT NOT NULL,
+    missing_ranges_json  TEXT NOT NULL,
+    created_at           TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_roll ON roll_snapshots (roll_no);
 """
 
 

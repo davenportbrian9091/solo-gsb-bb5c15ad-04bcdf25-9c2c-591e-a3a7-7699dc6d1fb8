@@ -80,6 +80,43 @@ class HealthOut(BaseModel):
     db: str
 
 
+class SnapshotOut(BaseModel):
+    snapshot_id: str = Field(..., description="快照 ID，可长期用于差异查询")
+    roll_no: str
+    expected_ranges: list[list[int]] = Field(
+        ..., description="固化时的预期覆盖闭区间（已合并）"
+    )
+    frame_ranges: list[list[int]] = Field(
+        ..., description="固化时的实扫帧，压缩为连续闭区间（如 [[1,3],[5,5]]）"
+    )
+    missing_ranges: list[list[int]] = Field(
+        ..., description="固化时的连续缺帧闭区间"
+    )
+    created_at: str
+
+
+class RangeDiff(BaseModel):
+    added_ranges: list[list[int]] = Field(
+        ..., description="相对快照新增的闭区间（当前状态 − 快照）"
+    )
+    removed_ranges: list[list[int]] = Field(
+        ..., description="相对快照消失的闭区间（快照 − 当前状态）"
+    )
+
+
+class SnapshotDiffOut(BaseModel):
+    snapshot_id: str
+    roll_no: str
+    roll_exists: bool = Field(
+        ...,
+        description="当前胶卷是否存在；最后一批被撤销后为 False，此时按空状态比较",
+    )
+    snapshot_created_at: str
+    expected: RangeDiff = Field(..., description="预期覆盖维度的新增/消失闭区间")
+    frames: RangeDiff = Field(..., description="实扫帧维度的新增/消失闭区间")
+    missing: RangeDiff = Field(..., description="缺帧维度的新增/消失闭区间")
+
+
 class RescanClaimIn(BaseModel):
     claimant: str = Field(..., min_length=1, description="领取人标识")
     max_frames: PositiveInt = Field(..., description="本次最多领取的帧数（正整数）")

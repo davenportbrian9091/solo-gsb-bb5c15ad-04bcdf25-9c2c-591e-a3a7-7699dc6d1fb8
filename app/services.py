@@ -792,3 +792,139 @@ def submit_rescan_receipt(
     ).fetchone()
     assert claim is not None and receipt is not None
     return _receipt_out(conn, claim, receipt, repeated=False), 201
+
+
+# ---------- 交付快照 ----------
+
+def frames_to_intervals(frames: set[int] | list[int]) -> list[tuple[int, int]]:
+    """把离散帧号集合压缩为连续闭区间，例如 {1,2,3,5} -> [(1,3),(5,5)]。
+
+    快照与差异对比全程以闭区间表示实扫帧，差异按区间做集合运算，
+    不逐帧展开大范围。
+    """
+    intervals: list[tuple[int, int]] = []
+    start: int | None = None
+    prev: int | None = None
+    for n in sorted(frames):
+        if start is None:
+            start = n
+            prev = n
+        elif n == prev + 1:
+            prev = n
+        else:
+            intervals.append((start, prev))
+            start = n
+            prev = n
+    if start is not None:
+        intervals.append((start, prev))
+    return intervals
+
+
+def _interval_state(conn: sqlite3.Connection, roll_no: str) -> dict:
+    """以闭区间读取胶卷当前状态（不逐帧展开大范围）。
+
+    缺帧区间直接由“预期覆盖 − 实扫帧区间”按区间集合差得到，
+    与逐帧判定的 missing_intervals 结果一致，但与预期范围大小无关。
+    """
+    expected = _expected_ranges(conn, roll_no)
+    frame_ranges = frames_to_intervals(_all_frames(conn, roll_no))
+    missing = subtract_intervals(expected, frame_ranges)
+    return {"expected": expected, "frames": frame_ranges, "missing": missing}
+
+
+def create_snapshot(
+    conn: sqlite3.Connection, roll_no: str
+) -> schemas.SnapshotOut:
+    """固化交付快照：在同一 BEGIN IMMEDIATE 事务内完成一致性读与落库。
+
+    快照只增不改：之后的批次导入、撤销或补扫都不回写快照内容。
+    胶卷不存在（尚未导入任何批次）抛 RollNotFoundError（接口返回 404）。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not _roll_exists(conn, roll_no):
+            raise RollNotFoundError(roll_no)
+        st = _interval_state(conn, roll_no)
+        snapshot_id = uuid.uuid4().hex
+        created_at = _now_iso()
+        conn.execute(
+            """INSERT INTO roll_snapshots
+                   (id, roll_no, expected_ranges_json, frame_ranges_json,
+                    missing_ranges_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                snapshot_id,
+                roll_no,
+                json.dumps(st["expected"]),
+                json.dumps(st["frames"]),
+                json.dumps(st["missing"]),
+                created_at,
+            ),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return schemas.SnapshotOut(
+        snapshot_id=snapshot_id,
+        roll_no=roll_no,
+        expected_ranges=[list(x) for x in st["expected"]],
+        frame_ranges=[list(x) for x in st["frames"]],
+        missing_ranges=[list(x) for x in st["missing"]],
+        created_at=created_at,
+    )
+
+
+def _ranges_diff(
+    old: list[tuple[int, int]], new: list[tuple[int, int]]
+) -> schemas.RangeDiff:
+    """单维度区间集合差：added = new − old（相对快照新增），
+    removed = old − new（相对快照消失）。"""
+    return schemas.RangeDiff(
+        added_ranges=[list(x) for x in subtract_intervals(new, old)],
+        removed_ranges=[list(x) for x in subtract_intervals(old, new)],
+    )
+
+
+def get_snapshot_diff(
+    conn: sqlite3.Connection, roll_no: str, snapshot_id: str
+) -> schemas.SnapshotDiffOut | None:
+    """对比快照与胶卷当前状态，三个维度（预期覆盖、实扫帧、缺帧）独立比较。
+
+    - 快照不存在或其胶卷编号与路径参数不匹配 → 返回 None（接口 404）。
+    - 快照内容只读，不随后续批次导入、撤销或补扫改变；即使胶卷最后一批
+      被撤销（胶卷视为不存在），也以空状态与快照比较并标记 roll_exists=False。
+    - 全部读取在同一事务内完成，保证拿到单一一致性视图。
+    """
+    conn.execute("BEGIN")
+    try:
+        row = conn.execute(
+            "SELECT * FROM roll_snapshots WHERE id = ?", (snapshot_id,)
+        ).fetchone()
+        if row is None or row["roll_no"] != roll_no:
+            conn.execute("ROLLBACK")
+            return None
+        snap = {
+            "expected": [tuple(x) for x in json.loads(row["expected_ranges_json"])],
+            "frames": [tuple(x) for x in json.loads(row["frame_ranges_json"])],
+            "missing": [tuple(x) for x in json.loads(row["missing_ranges_json"])],
+        }
+        roll_exists = _roll_exists(conn, roll_no)
+        if roll_exists:
+            current = _interval_state(conn, roll_no)
+        else:
+            # 胶卷已不存在（最后一批被撤销）：当前状态按空处理
+            current = {"expected": [], "frames": [], "missing": []}
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return schemas.SnapshotDiffOut(
+        snapshot_id=snapshot_id,
+        roll_no=roll_no,
+        roll_exists=roll_exists,
+        snapshot_created_at=row["created_at"],
+        expected=_ranges_diff(snap["expected"], current["expected"]),
+        frames=_ranges_diff(snap["frames"], current["frames"]),
+        missing=_ranges_diff(snap["missing"], current["missing"]),
+    )

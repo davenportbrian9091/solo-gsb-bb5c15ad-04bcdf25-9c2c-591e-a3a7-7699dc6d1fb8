@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="胶片档案扫描整理 API",
-    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执。",
-    version="1.3.0",
+    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照固化与区间级差异对比。",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -102,6 +102,46 @@ def get_roll(roll_no: str, conn: Connection = Depends(database.get_db)):
     result = services.get_roll_state(conn, roll_no.strip())
     if result is None:
         raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
+    return result
+
+
+@app.post(
+    "/rolls/{roll_no}/snapshots",
+    response_model=schemas.SnapshotOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["交付快照"],
+)
+def create_snapshot(roll_no: str, conn: Connection = Depends(database.get_db)):
+    """固化交付快照。
+
+    在同一写事务的一致性读中固化当时的**预期覆盖闭区间、实扫帧（压缩为连续
+    闭区间）与缺帧闭区间**，返回可长期查询的快照 ID。快照只增不改，不随后续
+    批次导入、撤销或补扫改变。胶卷不存在（尚未导入任何批次）返回 404。
+    """
+    try:
+        return services.create_snapshot(conn, roll_no.strip())
+    except services.RollNotFoundError:
+        raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
+
+
+@app.get(
+    "/rolls/{roll_no}/snapshots/{snapshot_id}/diff",
+    response_model=schemas.SnapshotDiffOut,
+    tags=["交付快照"],
+)
+def get_snapshot_diff(
+    roll_no: str, snapshot_id: str, conn: Connection = Depends(database.get_db)
+):
+    """对比快照与胶卷当前状态。
+
+    **预期覆盖、实扫帧、缺帧三个维度独立比较**，分别以闭区间返回相对快照
+    新增（当前 − 快照）与消失（快照 − 当前）的部分，差异按区间做集合运算，
+    不逐帧展开大范围。即使胶卷最后一批被撤销，也返回 ``roll_exists=false``
+    及与空状态的差异。未知快照或胶卷编号不匹配返回 404。
+    """
+    result = services.get_snapshot_diff(conn, roll_no.strip(), snapshot_id.strip())
+    if result is None:
+        raise HTTPException(status_code=404, detail="快照不存在或与胶卷编号不匹配")
     return result
 
 
